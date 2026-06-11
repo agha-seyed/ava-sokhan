@@ -16,23 +16,39 @@ import {
   ChevronLeft
 } from 'lucide-react';
 import { RecitationStyle, RecitationState, HistoryItem } from './types';
-import { VOICES, RECITATION_STYLES, MUSIC_OPTIONS, POEM_EXAMPLES } from './constants';
-import { generateRecitation } from './services/geminiService';
+import { VOICES, RECITATION_STYLES, MUSIC_OPTIONS, POEM_EXAMPLES, ENV_EFFECTS } from './constants';
+import { generateRecitation, interpretPoem, suggestOptimalConfig } from './services/geminiService';
 import { mixAudio, bufferToWaveUrl } from './services/audioService';
 
 const App: React.FC = () => {
-  const [state, setState] = useState<RecitationState>({
+  const [state, setState] = useState<RecitationState & {
+    interpretation: string | null;
+    isInterpreting: boolean;
+    isAutoConfiguring: boolean;
+  }>({
     text: '',
     style: RecitationStyle.POETIC,
     voice: VOICES[0].id,
     musicId: 'none',
+    envEffectId: 'none',
     isGenerating: false,
     audioUrl: null,
     history: [],
+    speed: 1.0,
+    enhancedEffects: false,
+    theme: 'default',
+    interpretation: null,
+    isInterpreting: false,
+    isAutoConfiguring: false,
   });
 
   const [error, setError] = useState<string | null>(null);
   const audioRef = useRef<HTMLAudioElement>(null);
+
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const analyserRef = useRef<AnalyserNode | null>(null);
+  const animationRef = useRef<number>(0);
 
   // Load history from localStorage
   useEffect(() => {
@@ -51,6 +67,79 @@ const App: React.FC = () => {
     localStorage.setItem('avaye_sokhan_history', JSON.stringify(state.history.slice(0, 10)));
   }, [state.history]);
 
+  // Audio Visualizer Setup
+  useEffect(() => {
+    if (state.audioUrl && audioRef.current && canvasRef.current) {
+      const audio = audioRef.current;
+      const canvas = canvasRef.current;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      if (!audioCtxRef.current) {
+        audioCtxRef.current = new (window.AudioContext || (window as any).webkitAudioContext)();
+      }
+      const audioCtx = audioCtxRef.current;
+
+      let source = (audio as any)._sourceNode;
+      if (!source) {
+        source = audioCtx.createMediaElementSource(audio);
+        (audio as any)._sourceNode = source;
+      }
+      
+      if (!analyserRef.current) {
+        analyserRef.current = audioCtx.createAnalyser();
+        analyserRef.current.fftSize = 256;
+        source.connect(analyserRef.current);
+        analyserRef.current.connect(audioCtx.destination);
+      }
+      const analyser = analyserRef.current;
+      const bufferLength = analyser.frequencyBinCount;
+      const dataArray = new Uint8Array(bufferLength);
+
+      const renderFrame = () => {
+        animationRef.current = requestAnimationFrame(renderFrame);
+        analyser.getByteFrequencyData(dataArray);
+
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        const barWidth = (canvas.width / bufferLength) * 2.5;
+        let x = 0;
+
+        for (let i = 0; i < bufferLength; i++) {
+          const barHeight = dataArray[i] / 2;
+          
+          const r = barHeight + 70;
+          const g = 100;
+          const b = 250;
+          
+          ctx.fillStyle = `rgb(${r},${g},${b})`;
+          ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+          x += barWidth + 1;
+        }
+      };
+      
+      audio.onplay = () => {
+        if (audioCtx.state === 'suspended') audioCtx.resume();
+        renderFrame();
+      };
+      
+      audio.onpause = () => {
+        cancelAnimationFrame(animationRef.current);
+      };
+
+      return () => {
+        cancelAnimationFrame(animationRef.current);
+      };
+    }
+  }, [state.audioUrl]);
+
+  // Adjust playback speed
+  useEffect(() => {
+    if (audioRef.current) {
+      audioRef.current.playbackRate = state.speed;
+    }
+  }, [state.speed, state.audioUrl]);
+
   const handleGenerate = async () => {
     if (!state.text.trim()) {
       setError('لطفا ابتدا متن شعر را وارد کنید.');
@@ -63,7 +152,8 @@ const App: React.FC = () => {
     try {
       const voiceBuffer = await generateRecitation(state.text, state.style, state.voice);
       const music = MUSIC_OPTIONS.find(m => m.id === state.musicId);
-      const finalBuffer = await mixAudio(voiceBuffer, music?.url || null);
+      const envEffect = ENV_EFFECTS.find(e => e.id === state.envEffectId);
+      const finalBuffer = await mixAudio(voiceBuffer, music?.url || null, envEffect?.url || null, state.enhancedEffects);
       const url = bufferToWaveUrl(finalBuffer);
       
       const newHistoryItem: HistoryItem = {
@@ -89,15 +179,68 @@ const App: React.FC = () => {
   };
 
   const loadExample = (text: string) => {
-    setState(prev => ({ ...prev, text }));
+    setState(prev => ({ ...prev, text, interpretation: null }));
+  };
+
+  const handleInterpret = async () => {
+    if (!state.text.trim()) {
+      setError('برای تفسیر، ابتدا شعر را وارد کنید.');
+      return;
+    }
+    setState(prev => ({ ...prev, isInterpreting: true }));
+    try {
+      const res = await interpretPoem(state.text);
+      setState(prev => ({ ...prev, interpretation: res, isInterpreting: false }));
+    } catch (e) {
+      setError('خطا در دریافت تفسیر.');
+      setState(prev => ({ ...prev, isInterpreting: false }));
+    }
+  };
+
+  const handleSmartAssistant = async () => {
+    if (!state.text.trim()) {
+      setError('برای استفاده از دستیار هوشمند، متن شعر را وارد کنید.');
+      return;
+    }
+    setState(prev => ({ ...prev, isAutoConfiguring: true }));
+    try {
+      const config = await suggestOptimalConfig(state.text);
+      setState(prev => ({ 
+        ...prev, 
+        style: config.style,
+        voice: config.voice,
+        musicId: config.musicId,
+        isAutoConfiguring: false 
+      }));
+    } catch (e) {
+      setError('خطا در عملکرد دستیار هوشمند.');
+      setState(prev => ({ ...prev, isAutoConfiguring: false }));
+    }
   };
 
   return (
-    <div className="min-h-screen pb-20 overflow-x-hidden">
+    <div className={`min-h-screen pb-20 overflow-x-hidden transition-colors duration-1000 ${
+      state.theme === 'smart' 
+        ? state.style === RecitationStyle.ROMANTIC ? 'bg-[#2a0e1b]' // Red-ish
+        : state.style === RecitationStyle.EPIC ? 'bg-[#1a0e08]'      // Orange-ish
+        : state.style === RecitationStyle.CALM ? 'bg-[#0a1f1f]'      // Teal/Cyan
+        : state.style === RecitationStyle.ANGRY ? 'bg-[#260505]'     // Dark red
+        : state.style === RecitationStyle.PROTEST ? 'bg-[#1b1c21]'   // Dark grey
+        : 'bg-[#0f172a]' // Default for Poetic
+        : 'bg-[#0f172a]' // Default theme
+    }`}>
       {/* Background Decor */}
-      <div className="fixed inset-0 -z-10 bg-[#0f172a]">
-        <div className="absolute top-0 right-0 w-[500px] h-[500px] bg-indigo-600/10 rounded-full blur-[120px]" />
-        <div className="absolute bottom-0 left-0 w-[500px] h-[500px] bg-purple-600/10 rounded-full blur-[120px]" />
+      <div className="fixed inset-0 -z-10 pointer-events-none">
+        <div className={`absolute top-0 right-0 w-[500px] h-[500px] rounded-full blur-[120px] transition-colors duration-1000 ${
+          state.theme === 'smart' && state.style === RecitationStyle.ROMANTIC ? 'bg-pink-600/20'
+          : state.theme === 'smart' && state.style === RecitationStyle.EPIC ? 'bg-orange-600/20'
+          : 'bg-indigo-600/10'
+        }`} />
+        <div className={`absolute bottom-0 left-0 w-[500px] h-[500px] rounded-full blur-[120px] transition-colors duration-1000 ${
+           state.theme === 'smart' && state.style === RecitationStyle.CALM ? 'bg-cyan-600/20'
+           : state.theme === 'smart' && state.style === RecitationStyle.PROTEST ? 'bg-zinc-600/20'
+           : 'bg-purple-600/10'
+        }`} />
       </div>
 
       <div className="max-w-6xl mx-auto px-4 pt-12">
@@ -130,39 +273,72 @@ const App: React.FC = () => {
                   <h2 className="text-xl font-bold text-slate-100">متن شعر شما</h2>
                 </div>
                 <div className="flex gap-2">
-                  {POEM_EXAMPLES.map(ex => (
-                    <button 
-                      key={ex.title}
-                      onClick={() => loadExample(ex.text)}
-                      className="text-xs bg-slate-800 hover:bg-slate-700 text-slate-300 px-3 py-1.5 rounded-lg border border-slate-700 transition-all"
-                    >
-                      {ex.title}
-                    </button>
-                  ))}
+                  <button 
+                    onClick={() => {
+                      const randomIdx = Math.floor(Math.random() * POEM_EXAMPLES.length);
+                      loadExample(POEM_EXAMPLES[randomIdx].text);
+                    }}
+                    className="text-xs bg-indigo-600 hover:bg-indigo-500 text-white px-4 py-2 rounded-xl transition-all shadow-lg flex items-center gap-2 font-bold"
+                  >
+                    <Sparkles className="w-4 h-4 text-amber-300" />
+                    گالری اشعار تصادفی
+                  </button>
                 </div>
               </div>
 
-              <textarea
-                value={state.text}
-                onChange={(e) => setState(prev => ({ ...prev, text: e.target.value }))}
-                placeholder="اینجا بنویسید... مثلاً: ای پادشه خوبان، داد از غم تنهایی"
-                className="w-full h-96 bg-transparent border-none focus:ring-0 text-xl leading-[2.5rem] text-slate-200 placeholder:text-slate-600 resize-none dir-rtl"
-                dir="rtl"
-              />
+              {state.isGenerating || state.audioUrl ? (
+                 <div className="w-full h-96 overflow-y-auto bg-slate-900/40 rounded-xl p-6 text-center shadow-inner flex flex-col justify-center items-center">
+                    {state.text.split('\n').map((line, i) => (
+                      <p key={i} className="text-xl md:text-2xl font-bold leading-relaxed mb-4 text-transparent bg-clip-text bg-gradient-to-r from-indigo-200 to-purple-200" dir="rtl">{line}</p>
+                    ))}
+                    <p className="text-slate-500 text-sm mt-4">-- پیش‌نمایش زنده --</p>
+                 </div>
+              ) : (
+                <textarea
+                  value={state.text}
+                  onChange={(e) => setState(prev => ({ ...prev, text: e.target.value }))}
+                  placeholder="اینجا بنویسید... مثلاً: ای پادشه خوبان، داد از غم تنهایی"
+                  className="w-full h-96 bg-transparent border-none focus:ring-0 text-xl leading-[2.5rem] text-slate-200 placeholder:text-slate-600 resize-none dir-rtl"
+                  dir="rtl"
+                />
+              )}
 
-              <div className="mt-4 pt-6 border-t border-slate-700/50 flex justify-between items-center">
+                <div className="mt-4 pt-6 border-t border-slate-700/50 flex justify-between items-center">
                 <div className="flex items-center gap-2 text-slate-500 text-sm">
                   <span className="bg-slate-800 px-2 py-1 rounded-md">{state.text.length} حرف</span>
                 </div>
-                <button 
-                  onClick={() => setState(prev => ({ ...prev, text: '' }))}
-                  className="text-slate-500 hover:text-red-400 text-sm flex items-center gap-2 transition-colors"
-                >
-                  <Trash2 className="w-4 h-4" />
-                  پاکسازی
-                </button>
+                <div className="flex gap-4">
+                  <button 
+                    onClick={handleInterpret}
+                    disabled={state.isInterpreting}
+                    className="text-indigo-400 hover:text-indigo-300 text-sm flex items-center gap-2 transition-colors disabled:opacity-50"
+                  >
+                    {state.isInterpreting ? <RefreshCw className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+                    تفسیر و معنی شعر
+                  </button>
+                  <button 
+                    onClick={() => setState(prev => ({ ...prev, text: '', interpretation: null }))}
+                    className="text-slate-500 hover:text-red-400 text-sm flex items-center gap-2 transition-colors"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    پاکسازی
+                  </button>
+                </div>
               </div>
             </div>
+
+            {/* Interpretation Card */}
+            {state.interpretation && (
+              <div className="glass p-6 rounded-[2rem] animate-in fade-in slide-in-from-top-4">
+                <div className="flex items-center gap-3 mb-4">
+                  <Sparkles className="w-5 h-5 text-indigo-400" />
+                  <h3 className="font-bold text-slate-200">تفسیر و ابعاد پنهان شعر</h3>
+                </div>
+                <div className="text-slate-300 text-sm leading-relaxed whitespace-pre-wrap font-sans">
+                  {state.interpretation}
+                </div>
+              </div>
+            )}
 
             {/* History Card */}
             {state.history.length > 0 && (
@@ -193,7 +369,23 @@ const App: React.FC = () => {
 
           {/* Config Area */}
           <div className="lg:col-span-5 space-y-6 animate-in slide-in-from-left-8 duration-700 delay-100">
-            <div className="glass p-8 rounded-[2.5rem] space-y-8">
+            <div className="glass p-8 rounded-[2.5rem] space-y-8 relative overflow-hidden">
+              <div className="absolute top-0 right-0 w-1 p-8 h-full bg-gradient-to-b from-purple-500 to-indigo-600 opacity-20" />
+              
+              {/* Smart Assistant Button */}
+              <button
+                onClick={handleSmartAssistant}
+                disabled={state.isAutoConfiguring}
+                className="w-full bg-slate-800/80 hover:bg-slate-700 border border-indigo-500/30 p-4 rounded-2xl flex items-center justify-center gap-3 transition-colors text-indigo-300 font-bold mb-4"
+              >
+                {state.isAutoConfiguring ? (
+                  <RefreshCw className="w-5 h-5 animate-spin" />
+                ) : (
+                  <Sparkles className="w-5 h-5 text-amber-300" />
+                )}
+                دستیار جادویی انتخاب لحن و ملودی
+              </button>
+
               {/* Styles */}
               <section>
                 <div className="flex items-center gap-2 mb-6">
@@ -238,7 +430,7 @@ const App: React.FC = () => {
                     <span>موسیقی پس‌زمینه</span>
                     {state.musicId !== 'none' && <Music className="w-3 h-3 animate-pulse text-indigo-400" />}
                   </label>
-                  <div className="grid grid-cols-2 gap-3">
+                  <div className="grid grid-cols-2 gap-3 mb-6">
                     {MUSIC_OPTIONS.map(m => (
                       <button
                         key={m.id}
@@ -253,6 +445,76 @@ const App: React.FC = () => {
                         {m.name}
                       </button>
                     ))}
+                  </div>
+                  
+                  <label className="block text-slate-400 text-sm mb-3 pr-2 flex justify-between items-center">
+                    <span>میکس افکت‌های محیطی</span>
+                  </label>
+                  <div className="grid grid-cols-2 gap-3">
+                    {ENV_EFFECTS.map(e => (
+                      <button
+                        key={e.id}
+                        onClick={() => setState(prev => ({ ...prev, envEffectId: e.id }))}
+                        className={`p-3 rounded-2xl text-xs transition-all border flex items-center justify-center gap-2 ${
+                          state.envEffectId === e.id 
+                          ? 'bg-indigo-600/20 border-indigo-500 text-indigo-300' 
+                          : 'bg-slate-800 border-slate-700 text-slate-500'
+                        }`}
+                      >
+                        {e.label}
+                      </button>
+                    ))}
+                  </div>
+                </section>
+
+                <section className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-slate-400 text-sm mb-2 pr-2">تنظیم دستی سرعت ({state.speed}x)</label>
+                    <input 
+                      type="range" 
+                      min="0.5" 
+                      max="2.0" 
+                      step="0.1" 
+                      value={state.speed}
+                      onChange={(e) => setState(prev => ({ ...prev, speed: parseFloat(e.target.value) }))}
+                      className="w-full accent-indigo-500"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-slate-400 text-sm mb-2 pr-2">افزایش افکت‌های صوتی</label>
+                    <button 
+                      onClick={() => setState(prev => ({ ...prev, enhancedEffects: !prev.enhancedEffects }))}
+                      className={`w-full p-2.5 rounded-xl border text-sm transition-all ${
+                        state.enhancedEffects 
+                          ? 'bg-indigo-600 border-indigo-500 text-white' 
+                          : 'bg-slate-800 border-slate-700 text-slate-400'
+                      }`}
+                    >
+                      {state.enhancedEffects ? 'فعال' : 'غیرفعال'}
+                    </button>
+                  </div>
+                </section>
+                
+                <section className="grid grid-cols-2 gap-4">
+                  <div>
+                    <label className="block text-slate-400 text-sm mb-2 pr-2">انتخاب تم</label>
+                    <select
+                      value={state.theme}
+                      onChange={(e) => setState(prev => ({ ...prev, theme: e.target.value }))}
+                      className="w-full bg-slate-800 border border-slate-700 rounded-xl p-3 text-slate-200 text-sm appearance-none focus:ring-2 focus:ring-indigo-500 outline-none"
+                    >
+                      <option value="default">پایه (پیش‌فرض)</option>
+                      <option value="smart">تم هوشمند اشعار</option>
+                    </select>
+                  </div>
+                  <div className="flex items-end">
+                    <button 
+                      onClick={() => { /* Placeholder for sync action */}}
+                      className="w-full bg-slate-700 hover:bg-slate-600 border border-slate-600 p-3 rounded-xl flex items-center justify-center gap-2 transition-colors text-slate-200 text-sm"
+                    >
+                      <RefreshCw className="w-4 h-4" />
+                      همگام سازی
+                    </button>
                   </div>
                 </section>
               </div>
@@ -300,22 +562,26 @@ const App: React.FC = () => {
                   </div>
                 </div>
                 
-                <div className="flex items-center gap-4 w-full md:w-auto">
-                  <audio 
-                    ref={audioRef}
-                    controls 
-                    src={state.audioUrl} 
-                    className="flex-1 accent-indigo-500" 
-                    autoPlay
-                  />
-                  <a 
-                    href={state.audioUrl} 
-                    download="avaye-sokhan.wav"
-                    className="p-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl transition-all shadow-lg"
-                    title="دانلود فایل"
-                  >
-                    <Download className="w-5 h-5" />
-                  </a>
+                <div className="flex flex-col w-full md:w-auto items-center md:items-end gap-2">
+                  <div className="flex items-center gap-4 w-full md:w-auto">
+                    <audio 
+                      ref={audioRef}
+                      controls 
+                      src={state.audioUrl} 
+                      className="flex-1 accent-indigo-500" 
+                      autoPlay
+                      crossOrigin="anonymous"
+                    />
+                    <a 
+                      href={state.audioUrl} 
+                      download="avaye-sokhan.wav"
+                      className="p-4 bg-indigo-600 hover:bg-indigo-700 text-white rounded-2xl transition-all shadow-lg"
+                      title="دانلود فایل"
+                    >
+                      <Download className="w-5 h-5" />
+                    </a>
+                  </div>
+                  <canvas ref={canvasRef} className="w-full h-12 rounded-lg opacity-80" width={400} height={48}></canvas>
                 </div>
               </div>
             </div>
@@ -333,7 +599,7 @@ const App: React.FC = () => {
       </div>
 
       <footer className="text-center mt-20 text-slate-600 text-sm pb-10">
-        <p>توسعه یافته با هوش مصنوعی جمینای فلاش ۲.۵</p>
+        <p>توسعه یافته شده توسط تیم ویرانگران</p>
       </footer>
     </div>
   );

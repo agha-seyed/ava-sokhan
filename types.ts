@@ -34,7 +34,11 @@ export interface RecitationState {
   style: RecitationStyle;
   voice: string;
   musicId: string;
+  envEffectId: string;
   isGenerating: boolean;
   audioUrl: string | null;
   history: HistoryItem[];
+  speed: number;
+  enhancedEffects: boolean;
+  theme: string;
 }

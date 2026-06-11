@@ -28,17 +28,30 @@ export async function decodeAudioData(
   return buffer;
 }
 
-export async function mixAudio(voiceBuffer: AudioBuffer, musicUrl: string | null): Promise<AudioBuffer> {
-  if (!musicUrl || musicUrl === '' || musicUrl === 'none') return voiceBuffer;
+export async function mixAudio(voiceBuffer: AudioBuffer, musicUrl: string | null, envEffectUrl: string | null = null, enhancedEffects: boolean = false): Promise<AudioBuffer> {
+  if ((!musicUrl || musicUrl === '' || musicUrl === 'none') && (!envEffectUrl || envEffectUrl === '' || envEffectUrl === 'none')) return voiceBuffer;
 
   const ctx = new (window.AudioContext || (window as any).webkitAudioContext)();
   
   try {
-    const musicResponse = await fetch(musicUrl);
-    if (!musicResponse.ok) throw new Error("Music fetch failed");
-    
-    const musicArrayBuffer = await musicResponse.arrayBuffer();
-    const musicBuffer = await ctx.decodeAudioData(musicArrayBuffer);
+    let musicBuffer: AudioBuffer | null = null;
+    let envBuffer: AudioBuffer | null = null;
+
+    if (musicUrl && musicUrl !== 'none') {
+      const musicResponse = await fetch(musicUrl);
+      if (musicResponse.ok) {
+        const musicArrayBuffer = await musicResponse.arrayBuffer();
+        musicBuffer = await ctx.decodeAudioData(musicArrayBuffer);
+      }
+    }
+
+    if (envEffectUrl && envEffectUrl !== 'none') {
+      const envResponse = await fetch(envEffectUrl);
+      if (envResponse.ok) {
+        const envArrayBuffer = await envResponse.arrayBuffer();
+        envBuffer = await ctx.decodeAudioData(envArrayBuffer);
+      }
+    }
 
     const length = voiceBuffer.length;
     const mixedBuffer = ctx.createBuffer(
@@ -51,20 +64,42 @@ export async function mixAudio(voiceBuffer: AudioBuffer, musicUrl: string | null
       const mixedData = mixedBuffer.getChannelData(channel);
       const voiceData = voiceBuffer.getChannelData(channel);
       
-      // If music has fewer channels, fallback to 0
-      const musicChannelIndex = channel < musicBuffer.numberOfChannels ? channel : 0;
-      const musicData = musicBuffer.getChannelData(musicChannelIndex);
+      const musicData = musicBuffer ? musicBuffer.getChannelData(channel < musicBuffer.numberOfChannels ? channel : 0) : null;
+      const envData = envBuffer ? envBuffer.getChannelData(channel < envBuffer.numberOfChannels ? channel : 0) : null;
+
+      let voiceEnvelope = 0;
+      let musicVolume = enhancedEffects ? 0.4 : 0.2;
+      const volumeMultiplier = enhancedEffects ? 2.0 : 1.0;
+      const baseEnvVolume = enhancedEffects ? 0.3 : 0.15;
 
       for (let i = 0; i < length; i++) {
-        // Loop the music if it's shorter than the voice
-        const musicSample = musicData[i % musicBuffer.length];
-        // Mix: 100% voice, 15% music for clarity
-        mixedData[i] = voiceData[i] + (musicSample * 0.15);
+        const musicSample = musicData ? musicData[i % musicBuffer!.length] : 0;
+        const envSample = envData ? envData[i % envBuffer!.length] : 0;
+        
+        // Calculate voice envelope for Audio Ducking (Fast attack, slow release)
+        const vSample = Math.abs(voiceData[i]);
+        if (vSample > voiceEnvelope) {
+          voiceEnvelope += (vSample - voiceEnvelope) * 0.01;
+        } else {
+          voiceEnvelope += (vSample - voiceEnvelope) * 0.0001; 
+        }
+
+        // Map envelope to music volume (Ducking)
+        const targetVol = Math.max(0.05 * volumeMultiplier, (0.25 * volumeMultiplier) - (voiceEnvelope * 1.5));
+        musicVolume += (targetVol - musicVolume) * 0.001; // Smooth volume transition
+
+        // Add some basic pseudo-reverb or echo directly if enhanced is true
+        let reverbSample = 0;
+        if (enhancedEffects && i > 4800) { // ~200ms delay at 24000Hz
+           reverbSample = voiceData[i - 4800] * 0.15;
+        }
+
+        mixedData[i] = voiceData[i] + reverbSample + (musicSample * musicVolume) + (envSample * baseEnvVolume);
       }
     }
     return mixedBuffer;
   } catch (error) {
-    console.error("Failed to mix music, returning original voice:", error);
+    console.error("Failed to mix audio layers, returning original voice:", error);
     return voiceBuffer;
   }
 }
